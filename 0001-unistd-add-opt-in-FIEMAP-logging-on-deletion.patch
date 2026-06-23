@@ -1,0 +1,337 @@
+From 91358cdc6862665d274788cd74d4699f60b4a87d Mon Sep 17 00:00:00 2001
+From: Xan Phung <xan.phung@gmail.com>
+Date: Tue, 23 Jun 2026 00:49:36 +1000
+Subject: [PATCH] unistd: add opt-in FIEMAP logging on deletion
+
+Add an opt-in facility for logging kernel FIEMAP metadata that may
+assist undelete when files are deleted through unlink, unlinkat, or
+remove. The opt-in is via configuration of MUSL_FIEMAP_PATH.
+
+When enabled, hold target delete inode until successful unlink, obtain
+the FIEMAP extents, and append bounded native-format records to the
+configured log file before releasing the inode.
+
+No file contents are retained. Capture, FIEMAP, and journal failures do
+not alter the deletion result or errno. Synchronization and durability
+are the administrator's responsibility, and secure-execution processes
+ignore the configuration.
+
+A conditional weak startup hook is used so static applications that do
+not reference the affected deletion functions do not include the logging
+implementation or environment scan.
+---
+ src/env/__libc_start_main.c |   7 +-
+ src/internal/fmlog.c        | 161 ++++++++++++++++++++++++++++++++++++
+ src/internal/fmlog.h        |  26 ++++++
+ src/internal/libc.h         |   1 +
+ src/stdio/remove.c          |   5 +-
+ src/unistd/unlink.c         |   8 +-
+ src/unistd/unlinkat.c       |   7 +-
+ 7 files changed, 210 insertions(+), 5 deletions(-)
+ create mode 100644 src/internal/fmlog.c
+ create mode 100644 src/internal/fmlog.h
+
+diff --git a/src/env/__libc_start_main.c b/src/env/__libc_start_main.c
+index c5b277b..224b909 100644
+--- a/src/env/__libc_start_main.c
++++ b/src/env/__libc_start_main.c
+@@ -10,6 +10,8 @@
+ static void dummy(void) {}
+ weak_alias(dummy, _init);
+ 
++extern weak hidden void __fmlog_init(char **);
++
+ extern weak hidden void (*const __init_array_start)(void), (*const __init_array_end)(void);
+ 
+ static void dummy1(void *p) {}
+@@ -40,7 +42,10 @@ void __init_libc(char **envp, char *pn)
+ 	__init_ssp((void *)aux[AT_RANDOM]);
+ 
+ 	if (aux[AT_UID]==aux[AT_EUID] && aux[AT_GID]==aux[AT_EGID]
+-		&& !aux[AT_SECURE]) return;
++		&& !aux[AT_SECURE]) {
++		if (__fmlog_init) __fmlog_init(envp);
++		return;
++	}
+ 
+ 	struct pollfd pfd[3] = { {.fd=0}, {.fd=1}, {.fd=2} };
+ 	int r =
+diff --git a/src/internal/fmlog.c b/src/internal/fmlog.c
+new file mode 100644
+index 0000000..4f1e6ef
+--- /dev/null
++++ b/src/internal/fmlog.c
+@@ -0,0 +1,161 @@
++#include <stddef.h>
++#include <stdint.h>
++#include <string.h>
++#include <unistd.h>
++#include <fcntl.h>
++#include <errno.h>
++#include <limits.h>
++#include <sys/ioctl.h>
++#include <sys/stat.h>
++#include "syscall.h"
++#include "fmlog.h"
++
++#define FIEMAP_EXTENT_LAST 0x00000001
++#define FS_IOC_FIEMAP _IOWR('f', 11, struct fiemap)
++
++static int log_fd = -1;
++
++void __fmlog_init(char **envp)
++{
++	struct stat st;
++	int fd = -1;
++	int opt = O_WRONLY|O_APPEND|O_CREAT|O_CLOEXEC|O_NOFOLLOW;
++
++	for (; *envp; envp++) {
++		if (strncmp(*envp, "MUSL_FIEMAP_PATH=", 17) == 0) {
++			char *path = *envp + 17;
++			fd = *path ? __sys_open(path, opt, 0600) : fd;
++			break;
++		}
++	}
++
++	if (fd < 0)
++		return;
++
++	if (!__fstat(fd, &st) && S_ISREG(st.st_mode))
++		log_fd = fd;
++	else
++		__syscall(SYS_close, fd);
++}
++
++int __fmlog_begin(struct fmlog_hdr *hdr, int dirfd, const char *path, int flag)
++{
++	struct stat st, dst;
++	int errsave, i;
++	int fd = -1;
++	int opt = O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_NOFOLLOW|O_LARGEFILE;
++	int max = sizeof hdr->path;
++
++	if (log_fd < 0 || !path || flag & AT_REMOVEDIR)
++		return -1;
++
++	errsave = errno;
++	if (__fstatat(dirfd, path, &st, AT_SYMLINK_NOFOLLOW))
++		goto out;
++	if (!S_ISREG(st.st_mode))
++		goto out;
++
++	fd  = __syscall(SYS_openat, dirfd, path, opt);
++	*hdr = (struct fmlog_hdr) {
++		.mode  = st.st_mode,
++		.uid   = st.st_uid,
++		.gid   = st.st_gid,
++		.mtime = st.st_mtime,
++		.ctime = st.st_ctime,
++		.dev   = st.st_dev,
++		.ino   = st.st_ino,
++		.size  = st.st_size,
++	};
++
++	if (*path != '/' && !__fstatat(dirfd, ".", &dst, 0))
++		hdr->dir_ino = (dst.st_dev == st.st_dev) ? dst.st_ino : 0;
++
++	for (i = 0; i < max && path[i]; i++)
++		hdr->path[i] = path[i];
++	i += i < max;
++	hdr->head = (offsetof(struct fmlog_hdr, path) + i + 15) & ~(size_t)15;
++
++out:
++	errno = errsave;
++	return fd;
++}
++
++int __fmlog_end(struct fmlog_hdr *hdr, int fd, long ret)
++{
++	struct stat st;
++	int errsave = errno;
++	int i, last, nr_ext;
++	uint64_t start, next, *p;
++
++	if (fd < 0)
++		return __syscall_ret(ret);
++	if (ret || __fstat(fd, &st))
++		goto out;
++	if (st.st_dev != hdr->dev || st.st_ino != hdr->ino)
++		goto out;
++
++	for (last = next = start = 0; !last; hdr->page++, start = next) {
++		struct fiemap_extent {
++			uint64_t logical, physical, length, reserved64[2];
++			uint32_t flags, reserved[3];
++		};
++		struct fiemap {
++			uint64_t start, length;
++			uint32_t flags, mapped_extents, extent_count;
++			uint32_t reserved;
++			struct fiemap_extent extents[];
++		};
++		struct fiemap_buf {
++			struct fiemap map;
++			struct fiemap_extent extents[EXT_MAX];
++		} fb;
++		uint32_t flags = st.st_nlink ? F_EXT_LINKS : 0;
++		uint64_t buf[sizeof *hdr / sizeof *p + EXT_MAX * 4];
++
++		fb = (struct fiemap_buf) {
++			.map.start = start,
++			.map.length = UINT64_MAX - start,
++			.map.mapped_extents = 0,
++			.map.extent_count = EXT_MAX,
++		};
++		if (__syscall(SYS_ioctl, fd, FS_IOC_FIEMAP, &fb) < 0)
++			break;
++
++		nr_ext = fb.map.mapped_extents;
++		if (nr_ext > EXT_MAX)
++			nr_ext = EXT_MAX;
++		if (nr_ext) {
++			struct fiemap_extent *ext = fb.extents + nr_ext - 1;
++			last = ext->flags & FIEMAP_EXTENT_LAST;
++			if (!last) {
++				next = ext->logical + ext->length;
++				last = next <= start || hdr->page == EXT_PAGES - 1;
++				flags |= last ? F_EXT_TRUNC : F_EXT_MORE;
++			}
++		} else {
++			if (hdr->page) break;
++			last = 1;
++		}
++		hdr->magic  = 0x70404d46 | flags << 24;
++		hdr->total  = hdr->head + nr_ext * sizeof *p * 4;
++		hdr->nr_ext = nr_ext;
++		memcpy(p = buf, hdr, hdr->head);
++		p += hdr->head / sizeof *p;
++
++		for (i = 0; i < nr_ext; i++, p += 4) {
++			struct fiemap_extent *ext = fb.extents + i;
++			p[0] = ext->logical;
++			p[1] = ext->physical;
++			p[2] = ext->length;
++			p[3] = ext->flags;
++		}
++
++		if (__syscall(SYS_write, log_fd, buf, hdr->total) != hdr->total)
++			break;
++	}
++
++out:
++	__syscall(SYS_close, fd);
++	errno = errsave;
++	return __syscall_ret(ret);
++}
+diff --git a/src/internal/fmlog.h b/src/internal/fmlog.h
+new file mode 100644
+index 0000000..bfbefca
+--- /dev/null
++++ b/src/internal/fmlog.h
+@@ -0,0 +1,26 @@
++#ifndef FMLOG_H
++#define FMLOG_H
++
++#include <features.h>
++#include <stdint.h>
++
++#define EXT_PAGES   256
++#define EXT_MAX     32
++
++#define F_EXT_LINKS 1  /* Flagged if >= 1 hardlinks remain */
++#define F_EXT_MORE  2
++#define F_EXT_TRUNC 4
++
++struct fmlog_hdr {
++	uint32_t magic;  /* Magic & path are at 16-byte offsets. View with od -t x4z */
++	uint16_t total, reserved;
++	uint16_t head, nr_ext, page, mode;
++	uint32_t uid, gid;
++	uint32_t mtime, ctime;
++	uint64_t size, dev, ino, dir_ino;
++	char path[256];  /* Slice length rounded up to 16 bytes; no NUL == truncated */
++};
++
++hidden int __fmlog_begin(struct fmlog_hdr *, int, const char *, int);
++hidden int __fmlog_end(struct fmlog_hdr *, int, long);
++#endif
+diff --git a/src/internal/libc.h b/src/internal/libc.h
+index 619bba8..c28f5e5 100644
+--- a/src/internal/libc.h
++++ b/src/internal/libc.h
+@@ -41,6 +41,7 @@ hidden void __init_libc(char **, char *);
+ hidden void __init_tls(size_t *);
+ hidden void __init_ssp(void *);
+ hidden void __libc_start_init(void);
++hidden void __fmlog_init(char **);
+ hidden void __funcs_on_exit(void);
+ hidden void __funcs_on_quick_exit(void);
+ hidden void __libc_exit_fini(void);
+diff --git a/src/stdio/remove.c b/src/stdio/remove.c
+index 942e301..66444aa 100644
+--- a/src/stdio/remove.c
++++ b/src/stdio/remove.c
+@@ -2,9 +2,12 @@
+ #include <errno.h>
+ #include <fcntl.h>
+ #include "syscall.h"
++#include "fmlog.h"
+ 
+ int remove(const char *path)
+ {
++	struct fmlog_hdr hdr;
++	int h = __fmlog_begin(&hdr, AT_FDCWD, path, 0);
+ #ifdef SYS_unlink
+ 	int r = __syscall(SYS_unlink, path);
+ #else
+@@ -15,5 +18,5 @@ int remove(const char *path)
+ #else
+ 	if (r==-EISDIR) r = __syscall(SYS_unlinkat, AT_FDCWD, path, AT_REMOVEDIR);
+ #endif
+-	return __syscall_ret(r);
++	return __fmlog_end(&hdr, h, r);
+ }
+diff --git a/src/unistd/unlink.c b/src/unistd/unlink.c
+index c40c28d..64f28ad 100644
+--- a/src/unistd/unlink.c
++++ b/src/unistd/unlink.c
+@@ -1,12 +1,16 @@
+ #include <unistd.h>
+ #include <fcntl.h>
+ #include "syscall.h"
++#include "fmlog.h"
+ 
+ int unlink(const char *path)
+ {
++	struct fmlog_hdr hdr;
++	int h = __fmlog_begin(&hdr, AT_FDCWD, path, 0);
+ #ifdef SYS_unlink
+-	return syscall(SYS_unlink, path);
++	int r = __syscall(SYS_unlink, path);
+ #else
+-	return syscall(SYS_unlinkat, AT_FDCWD, path, 0);
++	int r = __syscall(SYS_unlinkat, AT_FDCWD, path, 0);
+ #endif
++	return __fmlog_end(&hdr, h, r);
+ }
+diff --git a/src/unistd/unlinkat.c b/src/unistd/unlinkat.c
+index e0e25d2..c6aed59 100644
+--- a/src/unistd/unlinkat.c
++++ b/src/unistd/unlinkat.c
+@@ -1,7 +1,12 @@
+ #include <unistd.h>
+ #include "syscall.h"
++#include "fmlog.h"
+ 
+ int unlinkat(int fd, const char *path, int flag)
+ {
+-	return syscall(SYS_unlinkat, fd, path, flag);
++	struct fmlog_hdr hdr;
++	int h = __fmlog_begin(&hdr, fd, path, flag);
++	int r = __syscall(SYS_unlinkat, fd, path, flag);
++
++	return __fmlog_end(&hdr, h, r);
+ }
+-- 
+2.51.2
+
